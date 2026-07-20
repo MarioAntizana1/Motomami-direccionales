@@ -23,9 +23,9 @@
 #define BLINK_MS       300
 #define RENDER_MS      50
 
-#define WIFI_SSID      "WIFI_SSID"
-#define WIFI_PASS      "WIFI_PASS"
-#define MQTT_BROKER    "mqtt://192.168.1.100"
+#define WIFI_SSID      "Mario-wifi"
+#define WIFI_PASS      "572Huanuco321"
+#define MQTT_BROKER    "mqtt://192.168.31.173"
 
 static const char *TAG = "neo";
 
@@ -40,6 +40,9 @@ static bool brake_active = false;
 static bool night_active = false;
 static bool blink_on = true;
 static uint32_t frame = 0;
+
+static esp_mqtt_client_handle_t mqtt_client;
+static bool wifi_connected = false;
 
 static uint32_t get_led_index(uint32_t row, uint32_t col)
 {
@@ -85,41 +88,6 @@ void luz_nocturna(bool activar)
 {
     night_active = activar;
     ESP_LOGI(TAG, "luz_nocturna: %s", activar ? "ON" : "OFF");
-}
-
-static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data)
-{
-    if (id == WIFI_EVENT_STA_START) {
-        esp_wifi_connect();
-    } else if (id == WIFI_EVENT_STA_DISCONNECTED) {
-        esp_wifi_connect();
-        ESP_LOGI(TAG, "WiFi reconnect...");
-    }
-}
-
-static void wifi_init(void)
-{
-    esp_netif_init();
-    esp_event_loop_create_default();
-    esp_netif_create_default_wifi_sta();
-
-    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    esp_wifi_init(&cfg);
-
-    esp_event_handler_instance_t instance;
-    esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL, &instance);
-
-    wifi_config_t wifi_config = {
-        .sta = {
-            .ssid = WIFI_SSID,
-            .password = WIFI_PASS,
-        },
-    };
-    esp_wifi_set_mode(WIFI_MODE_STA);
-    esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
-    esp_wifi_start();
-
-    ESP_LOGI(TAG, "WiFi connecting to %s...", WIFI_SSID);
 }
 
 static void mqtt_event_handler(void *args, esp_event_base_t base, int32_t event_id, void *data)
@@ -171,6 +139,58 @@ static void mqtt_event_handler(void *args, esp_event_base_t base, int32_t event_
     default:
         break;
     }
+}
+
+static void start_mqtt(void)
+{
+    esp_mqtt_client_config_t mqtt_cfg = {
+        .broker.address.uri = MQTT_BROKER,
+    };
+    mqtt_client = esp_mqtt_client_init(&mqtt_cfg);
+    esp_mqtt_client_register_event(mqtt_client, ESP_EVENT_ANY_ID, mqtt_event_handler, NULL);
+    esp_mqtt_client_start(mqtt_client);
+}
+
+static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data)
+{
+    if (id == WIFI_EVENT_STA_START) {
+        esp_wifi_connect();
+    } else if (id == WIFI_EVENT_STA_DISCONNECTED) {
+        wifi_connected = false;
+        esp_wifi_connect();
+        ESP_LOGI(TAG, "WiFi reconnect...");
+    } else if (id == IP_EVENT_STA_GOT_IP) {
+        wifi_connected = true;
+        ESP_LOGI(TAG, "WiFi connected, starting MQTT...");
+        start_mqtt();
+    }
+}
+
+static void wifi_init(void)
+{
+    esp_netif_init();
+    esp_event_loop_create_default();
+    esp_netif_create_default_wifi_sta();
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    esp_wifi_init(&cfg);
+
+    esp_event_handler_instance_t instance_any;
+    esp_event_handler_instance_t instance_got_ip;
+    esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL, &instance_any);
+    esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL, &instance_got_ip);
+
+    wifi_config_t wifi_config = {
+        .sta = {
+            .ssid = WIFI_SSID,
+            .password = WIFI_PASS,
+        },
+    };
+    esp_wifi_set_mode(WIFI_MODE_STA);
+    esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
+    esp_wifi_start();
+
+    ESP_LOGI(TAG, "WiFi connecting to %s...", WIFI_SSID);
 }
 
 static void render_task(void *arg)
@@ -269,13 +289,6 @@ void app_main(void)
 
     ESP_LOGI(TAG, "Enable RMT TX channel");
     ESP_ERROR_CHECK(rmt_enable(led_chan));
-
-    esp_mqtt_client_config_t mqtt_cfg = {
-        .broker.address.uri = MQTT_BROKER,
-    };
-    esp_mqtt_client_handle_t mqtt_client = esp_mqtt_client_init(&mqtt_cfg);
-    esp_mqtt_client_register_event(mqtt_client, ESP_EVENT_ANY_ID, mqtt_event_handler, NULL);
-    esp_mqtt_client_start(mqtt_client);
 
     xTaskCreate(render_task, "render", 4096, NULL, 5, NULL);
 }
