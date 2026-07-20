@@ -21,7 +21,7 @@
 #define MID_COLS       10
 #define RIGHT_COLS     9
 #define BLINK_MS       300
-#define RENDER_MS      20
+#define RENDER_MS      30
 
 #define WIFI_SSID      "Mario-wifi"
 #define WIFI_PASS      "572Huanuco321"
@@ -228,7 +228,7 @@ static void draw_directional_side(bool active, int ncols, int offset, uint32_t f
 
     if (phase >= total_frames) return;
 
-    uint8_t cr = 245, cg = 233, cb = 66;
+    uint8_t cr = 255, cg = 200, cb = 0;
     int lit;
 
     if (phase < 9) {
