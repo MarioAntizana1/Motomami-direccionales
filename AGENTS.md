@@ -31,7 +31,7 @@ AGENTS.md                 # Memoria del proyecto (este archivo)
 ## Código existente
 - Control de NeoPixels vía RMT (periférico del ESP32-C6)
 - `get_led_index(row, col)`: mapeo zig-zag (filas pares ← derecha a izquierda, impares → izquierda a derecha)
-- Formato de color: GRB (Green, Blue, Red)
+- Formato de color: RGB (Red, Green, Blue)
 
 ## Reglas de workflow automático
 
