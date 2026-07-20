@@ -21,7 +21,7 @@
 #define MID_COLS       10
 #define RIGHT_COLS     9
 #define BLINK_MS       300
-#define RENDER_MS      50
+#define RENDER_MS      20
 
 #define WIFI_SSID      "Mario-wifi"
 #define WIFI_PASS      "572Huanuco321"
@@ -38,7 +38,6 @@ static bool right_active = false;
 static bool hazard_active = false;
 static bool brake_active = false;
 static bool night_active = false;
-static bool blink_on = true;
 static uint32_t frame = 0;
 
 static esp_mqtt_client_handle_t mqtt_client;
@@ -58,6 +57,32 @@ static void set_pixel(uint32_t row, uint32_t col, uint8_t r, uint8_t g, uint8_t 
     led_strip_pixels[idx * 3 + 0] = g;
     led_strip_pixels[idx * 3 + 1] = b;
     led_strip_pixels[idx * 3 + 2] = r;
+}
+
+static void hsv_to_rgb(uint8_t h, uint8_t s, uint8_t v, uint8_t *r, uint8_t *g, uint8_t *b)
+{
+    uint8_t region, remainder, p, q, t;
+    if (s == 0) { *r = v; *g = v; *b = v; return; }
+    region = h / 43;
+    remainder = (h - region * 43) * 6;
+    p = (v * (255 - s)) >> 8;
+    q = (v * (255 - ((s * remainder) >> 8))) >> 8;
+    t = (v * (255 - ((s * (255 - remainder)) >> 8))) >> 8;
+    switch (region) {
+        case 0: *r = v; *g = t; *b = p; break;
+        case 1: *r = q; *g = v; *b = p; break;
+        case 2: *r = p; *g = v; *b = t; break;
+        case 3: *r = p; *g = q; *b = v; break;
+        case 4: *r = t; *g = p; *b = v; break;
+        default: *r = v; *g = p; *b = q; break;
+    }
+}
+
+static void set_pixel_hsv(uint32_t row, uint32_t col, uint8_t h, uint8_t s, uint8_t v)
+{
+    uint8_t r, g, b;
+    hsv_to_rgb(h, s, v, &r, &g, &b);
+    set_pixel(row, col, r, g, b);
 }
 
 void intermitente_izquierda(bool activar)
@@ -193,20 +218,77 @@ static void wifi_init(void)
     ESP_LOGI(TAG, "WiFi connecting to %s...", WIFI_SSID);
 }
 
+static void draw_directional_side(bool active, int ncols, int offset, uint32_t f, bool reverse)
+{
+    if (!active) return;
+
+    uint32_t total_frames = 14;
+    uint32_t off_frames = BLINK_MS / RENDER_MS;
+    uint32_t phase = f % (total_frames + off_frames);
+
+    if (phase >= total_frames) return;
+
+    uint8_t cr = 245, cg = 233, cb = 66;
+    int lit;
+
+    if (phase < 9) {
+        lit = 9 - (int)phase;
+    } else {
+        static const int grow[] = {1, 2, 4, 6, 9};
+        lit = grow[phase - 9];
+    }
+
+    int rows_shrink[3] = {1, 2, 3};
+    int n_shrink = 3;
+
+    if (phase < 9) {
+        for (int i = 0; i < n_shrink; i++) {
+            for (int c = 0; c < lit; c++) {
+                int col = reverse ? (offset + ncols - 1 - c) : (offset + c);
+                set_pixel(rows_shrink[i], col, cr, cg, cb);
+            }
+        }
+    } else {
+        for (int c = 0; c < lit; c++) {
+            int col = reverse ? (offset + ncols - 1 - c) : (offset + c);
+            set_pixel(2, col, cr, cg, cb);
+        }
+    }
+}
+
+static void draw_night_light(uint32_t f)
+{
+    uint8_t sat = 180;
+    uint8_t bright = 80;
+
+    for (int c = 0; c < LED_COLS; c++) {
+        set_pixel_hsv(0, c, (uint8_t)(c * 9 + f * 2), sat, bright);
+        set_pixel_hsv(4, c, (uint8_t)(c * 9 + f * 2 + 85), sat, bright);
+    }
+
+    uint32_t breath_period = 16;
+    uint32_t bp = f % breath_period;
+    int bar_start, bar_end;
+
+    if (bp < 8) {
+        bar_start = bp * 2;
+        bar_end = LED_COLS - 1 - bp * 2;
+    } else {
+        uint32_t r = 15 - bp;
+        bar_start = r * 2;
+        bar_end = LED_COLS - 1 - r * 2;
+    }
+
+    if (bar_start > bar_end) { bar_start = 0; bar_end = -1; }
+
+    for (int c = bar_start; c <= bar_end; c++)
+        set_pixel_hsv(2, c, (uint8_t)(c * 9 + f * 3 + 42), 200, 160);
+}
+
 static void render_task(void *arg)
 {
-    TickType_t last_blink = xTaskGetTickCount();
-
     while (1) {
-        TickType_t now = xTaskGetTickCount();
-        if (now - last_blink >= pdMS_TO_TICKS(BLINK_MS)) {
-            blink_on = !blink_on;
-            last_blink = now;
-        }
-
         bool any_dir = left_active || right_active || hazard_active;
-        bool l_on = (left_active || hazard_active) && blink_on;
-        bool r_on = (right_active || hazard_active) && blink_on;
 
         memset(led_strip_pixels, 0, sizeof(led_strip_pixels));
 
@@ -223,37 +305,13 @@ static void render_task(void *arg)
             }
         }
 
-        if (night_active) {
-            uint8_t dim = 102;
-            for (int r = 0; r < LED_ROWS; r += 4) {
-                for (int c = 0; c < LED_COLS; c++) {
-                    if (any_dir) {
-                        bool in_left_blink = (c < LEFT_COLS) && l_on;
-                        bool in_right_blink = (c >= LED_COLS - RIGHT_COLS) && r_on;
-                        if (in_left_blink || in_right_blink)
-                            continue;
-                    }
-                    set_pixel(r, c, dim, 0, 0);
-                }
-            }
-            for (int c = 9; c <= 18; c++) {
-                float phase = (float)(c - 9) / (MID_COLS - 1) * 2.0f * 3.14159f;
-                float wave = (sinf(phase + frame * 0.15f) + 1.0f) / 2.0f;
-                uint8_t v = (uint8_t)(wave * 50.0f);
-                for (int r = 0; r < LED_ROWS; r++)
-                    set_pixel(r, c, v, 0, 0);
-            }
+        if (night_active && !brake_active) {
+            draw_night_light(frame);
         }
 
-        if (l_on) {
-            for (int r = 0; r < LED_ROWS; r++)
-                for (int c = 0; c < LEFT_COLS; c++)
-                    set_pixel(r, c, 255, 80, 0);
-        }
-        if (r_on) {
-            for (int r = 0; r < LED_ROWS; r++)
-                for (int c = LED_COLS - RIGHT_COLS; c < LED_COLS; c++)
-                    set_pixel(r, c, 255, 80, 0);
+        if (any_dir) {
+            draw_directional_side(left_active || hazard_active, LEFT_COLS, 0, frame, false);
+            draw_directional_side(right_active || hazard_active, RIGHT_COLS, LED_COLS - RIGHT_COLS, frame, true);
         }
 
         rmt_transmit_config_t tx = { .loop_count = 0 };
