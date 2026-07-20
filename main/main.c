@@ -20,8 +20,7 @@
 #define LEFT_COLS      9
 #define MID_COLS       10
 #define RIGHT_COLS     9
-#define BLINK_OFF_MS   2580
-#define RENDER_MS      30
+#define RENDER_MS      71
 
 #define WIFI_SSID      "Mario-wifi"
 #define WIFI_PASS      "572Huanuco321"
@@ -56,8 +55,8 @@ static uint32_t get_led_index(uint32_t row, uint32_t col)
 static void set_pixel(uint32_t row, uint32_t col, uint8_t r, uint8_t g, uint8_t b)
 {
     uint32_t idx = get_led_index(row, col);
-    led_strip_pixels[idx * 3 + 0] = r;
-    led_strip_pixels[idx * 3 + 1] = g;
+    led_strip_pixels[idx * 3 + 0] = g;
+    led_strip_pixels[idx * 3 + 1] = r;
     led_strip_pixels[idx * 3 + 2] = b;
 }
 
@@ -236,10 +235,7 @@ static void draw_directional_side(bool active, int ncols, int offset, uint32_t f
     if (!active) return;
 
     uint32_t total_frames = 14;
-    uint32_t off_frames = BLINK_OFF_MS / RENDER_MS;
-    uint32_t phase = f % (total_frames + off_frames);
-
-    if (phase >= total_frames) return;
+    uint32_t phase = f % total_frames;
 
     uint8_t cr = (255 * main_intensity) / 100;
     uint8_t cg = (200 * main_intensity) / 100;
