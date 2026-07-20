@@ -20,7 +20,7 @@
 #define LEFT_COLS      9
 #define MID_COLS       10
 #define RIGHT_COLS     9
-#define BLINK_MS       300
+#define BLINK_OFF_MS   2580
 #define RENDER_MS      30
 
 #define WIFI_SSID      "Mario-wifi"
@@ -38,6 +38,8 @@ static bool right_active = false;
 static bool hazard_active = false;
 static bool brake_active = false;
 static bool night_active = false;
+static uint8_t night_intensity = 100;
+static uint8_t main_intensity = 100;
 static uint32_t frame = 0;
 
 static esp_mqtt_client_handle_t mqtt_client;
@@ -128,6 +130,8 @@ static void mqtt_event_handler(void *args, esp_event_base_t base, int32_t event_
         esp_mqtt_client_subscribe(client, "motomami/intermitente_emergencia", 1);
         esp_mqtt_client_subscribe(client, "motomami/frenado", 1);
         esp_mqtt_client_subscribe(client, "motomami/luz_nocturna", 1);
+        esp_mqtt_client_subscribe(client, "motomami/luz_nocturna/intensidad", 1);
+        esp_mqtt_client_subscribe(client, "motomami/intensidad", 1);
         break;
 
     case MQTT_EVENT_DATA: {
@@ -154,6 +158,15 @@ static void mqtt_event_handler(void *args, esp_event_base_t base, int32_t event_
             frenado(on);
         else if (strcmp(topic, "motomami/luz_nocturna") == 0)
             luz_nocturna(on);
+        else if (strcmp(topic, "motomami/luz_nocturna/intensidad") == 0) {
+            int val = atoi(payload);
+            if (val >= 0 && val <= 100) night_intensity = (uint8_t)val;
+            ESP_LOGI(TAG, "night_intensity: %d%%", night_intensity);
+        } else if (strcmp(topic, "motomami/intensidad") == 0) {
+            int val = atoi(payload);
+            if (val >= 0 && val <= 100) main_intensity = (uint8_t)val;
+            ESP_LOGI(TAG, "main_intensity: %d%%", main_intensity);
+        }
         break;
     }
 
@@ -223,12 +236,14 @@ static void draw_directional_side(bool active, int ncols, int offset, uint32_t f
     if (!active) return;
 
     uint32_t total_frames = 14;
-    uint32_t off_frames = BLINK_MS / RENDER_MS;
+    uint32_t off_frames = BLINK_OFF_MS / RENDER_MS;
     uint32_t phase = f % (total_frames + off_frames);
 
     if (phase >= total_frames) return;
 
-    uint8_t cr = 255, cg = 200, cb = 0;
+    uint8_t cr = (255 * main_intensity) / 100;
+    uint8_t cg = (200 * main_intensity) / 100;
+    uint8_t cb = 0;
     int lit;
 
     if (phase < 9) {
@@ -267,6 +282,8 @@ static void draw_night_light(uint32_t f)
     else
         v = 5 + ((period - 1 - bp) * 71) / half;
 
+    v = (v * night_intensity) / 100;
+
     uint8_t h = (uint8_t)(f * 2);
 
     for (int c = 0; c < LED_COLS; c++) {
@@ -284,7 +301,7 @@ static void render_task(void *arg)
         memset(led_strip_pixels, 0, sizeof(led_strip_pixels));
 
         if (brake_active) {
-            uint8_t r_val = 255;
+            uint8_t r_val = (255 * main_intensity) / 100;
             if (any_dir) {
                 for (int r = 0; r < LED_ROWS; r++)
                     for (int c = 9; c <= 18; c++)
