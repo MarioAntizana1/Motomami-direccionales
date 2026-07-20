@@ -258,31 +258,22 @@ static void draw_directional_side(bool active, int ncols, int offset, uint32_t f
 
 static void draw_night_light(uint32_t f)
 {
-    uint8_t sat = 180;
-    uint8_t bright = 80;
+    uint32_t period = 60;
+    uint32_t bp = f % period;
+    uint32_t half = period / 2;
+    uint8_t v;
+    if (bp < half)
+        v = 5 + (bp * 71) / half;
+    else
+        v = 5 + ((period - 1 - bp) * 71) / half;
+
+    uint8_t h = (uint8_t)(f * 2);
 
     for (int c = 0; c < LED_COLS; c++) {
-        set_pixel_hsv(0, c, (uint8_t)(c * 9 + f * 2), sat, bright);
-        set_pixel_hsv(4, c, (uint8_t)(c * 9 + f * 2 + 85), sat, bright);
+        set_pixel_hsv(0, c, h, 200, v);
+        set_pixel_hsv(2, c, h, 200, v);
+        set_pixel_hsv(4, c, (uint8_t)(h + 40), 200, v);
     }
-
-    uint32_t breath_period = 16;
-    uint32_t bp = f % breath_period;
-    int bar_start, bar_end;
-
-    if (bp < 8) {
-        bar_start = bp * 2;
-        bar_end = LED_COLS - 1 - bp * 2;
-    } else {
-        uint32_t r = 15 - bp;
-        bar_start = r * 2;
-        bar_end = LED_COLS - 1 - r * 2;
-    }
-
-    if (bar_start > bar_end) { bar_start = 0; bar_end = -1; }
-
-    for (int c = bar_start; c <= bar_end; c++)
-        set_pixel_hsv(2, c, (uint8_t)(c * 9 + f * 3 + 42), 200, 160);
 }
 
 static void render_task(void *arg)
