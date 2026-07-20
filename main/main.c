@@ -56,9 +56,9 @@ static uint32_t get_led_index(uint32_t row, uint32_t col)
 static void set_pixel(uint32_t row, uint32_t col, uint8_t r, uint8_t g, uint8_t b)
 {
     uint32_t idx = get_led_index(row, col);
-    led_strip_pixels[idx * 3 + 0] = r;
-    led_strip_pixels[idx * 3 + 1] = g;
-    led_strip_pixels[idx * 3 + 2] = b;
+    led_strip_pixels[idx * 3 + 0] = g;
+    led_strip_pixels[idx * 3 + 1] = b;
+    led_strip_pixels[idx * 3 + 2] = r;
 }
 
 static void hsv_to_rgb(uint8_t h, uint8_t s, uint8_t v, uint8_t *r, uint8_t *g, uint8_t *b)
