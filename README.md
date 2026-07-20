@@ -71,3 +71,13 @@ idf.py -p COM3 build flash monitor  # Todo en uno
 - Configuración de opencode: skill `esp32-build`, AGENTS.md con reglas de workflow automático
 - Graphify: grafo de conocimiento del código (20 nodos, 24 edges, 5 comunidades)
 - Primer commit y push a `main` en GitHub
+
+### 2026-07-19 — Funciones de iluminación
+
+- **intermitente_izquierda(bool)**: 9 columnas izquierdas (0-8) parpadean ámbar cada 0.3s
+- **intermitente_derecha(bool)**: 9 columnas derechas (19-27) parpadean ámbar cada 0.3s
+- **intermitente_emergencia(bool)**: ambas laterales parpadean ámbar simultáneamente
+- **frenado(bool)**: 10 columnas centrales (9-18) en rojo fijo; sin direccionales activas cubre toda la matriz
+- **luz_nocturna(bool)**: filas 0 y 4 en rojo tenue (40%) + onda sinusoidal animada en columnas centrales
+- Sistema de composición: direccionales conviven con freno/luz nocturna, cada modo respeta sus áreas
+- Render loop continuo vía FreeRTOS task a 20 FPS

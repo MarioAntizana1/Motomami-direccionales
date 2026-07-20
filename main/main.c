@@ -5,6 +5,11 @@
 #include "esp_log.h"
 #include "driver/rmt_tx.h"
 #include "led_strip_encoder.h"
+#include "nvs_flash.h"
+#include "esp_netif.h"
+#include "esp_event.h"
+#include "esp_wifi.h"
+#include "mqtt_client.h"
 
 #define LED_GPIO_PIN                2
 #define LED_NUM                     140
@@ -17,6 +22,10 @@
 #define RIGHT_COLS     9
 #define BLINK_MS       300
 #define RENDER_MS      50
+
+#define WIFI_SSID      "WIFI_SSID"
+#define WIFI_PASS      "WIFI_PASS"
+#define MQTT_BROKER    "mqtt://192.168.1.100"
 
 static const char *TAG = "neo";
 
@@ -78,6 +87,92 @@ void luz_nocturna(bool activar)
     ESP_LOGI(TAG, "luz_nocturna: %s", activar ? "ON" : "OFF");
 }
 
+static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data)
+{
+    if (id == WIFI_EVENT_STA_START) {
+        esp_wifi_connect();
+    } else if (id == WIFI_EVENT_STA_DISCONNECTED) {
+        esp_wifi_connect();
+        ESP_LOGI(TAG, "WiFi reconnect...");
+    }
+}
+
+static void wifi_init(void)
+{
+    esp_netif_init();
+    esp_event_loop_create_default();
+    esp_netif_create_default_wifi_sta();
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    esp_wifi_init(&cfg);
+
+    esp_event_handler_instance_t instance;
+    esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL, &instance);
+
+    wifi_config_t wifi_config = {
+        .sta = {
+            .ssid = WIFI_SSID,
+            .password = WIFI_PASS,
+        },
+    };
+    esp_wifi_set_mode(WIFI_MODE_STA);
+    esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
+    esp_wifi_start();
+
+    ESP_LOGI(TAG, "WiFi connecting to %s...", WIFI_SSID);
+}
+
+static void mqtt_event_handler(void *args, esp_event_base_t base, int32_t event_id, void *data)
+{
+    esp_mqtt_event_t *event = data;
+    esp_mqtt_client_handle_t client = event->client;
+
+    switch ((esp_mqtt_event_id_t)event_id) {
+    case MQTT_EVENT_CONNECTED:
+        ESP_LOGI(TAG, "MQTT connected");
+        esp_mqtt_client_subscribe(client, "motomami/intermitente_izquierda", 1);
+        esp_mqtt_client_subscribe(client, "motomami/intermitente_derecha", 1);
+        esp_mqtt_client_subscribe(client, "motomami/intermitente_emergencia", 1);
+        esp_mqtt_client_subscribe(client, "motomami/frenado", 1);
+        esp_mqtt_client_subscribe(client, "motomami/luz_nocturna", 1);
+        break;
+
+    case MQTT_EVENT_DATA: {
+        char topic[64];
+        char payload[16];
+        int tlen = event->topic_len;
+        int plen = event->data_len;
+        if (tlen >= sizeof(topic)) tlen = sizeof(topic) - 1;
+        if (plen >= sizeof(payload)) plen = sizeof(payload) - 1;
+        memcpy(topic, event->topic, tlen);
+        topic[tlen] = 0;
+        memcpy(payload, event->data, plen);
+        payload[plen] = 0;
+
+        bool on = (strcasecmp(payload, "ON") == 0);
+
+        if (strcmp(topic, "motomami/intermitente_izquierda") == 0)
+            intermitente_izquierda(on);
+        else if (strcmp(topic, "motomami/intermitente_derecha") == 0)
+            intermitente_derecha(on);
+        else if (strcmp(topic, "motomami/intermitente_emergencia") == 0)
+            intermitente_emergencia(on);
+        else if (strcmp(topic, "motomami/frenado") == 0)
+            frenado(on);
+        else if (strcmp(topic, "motomami/luz_nocturna") == 0)
+            luz_nocturna(on);
+        break;
+    }
+
+    case MQTT_EVENT_ERROR:
+        ESP_LOGE(TAG, "MQTT error");
+        break;
+
+    default:
+        break;
+    }
+}
+
 static void render_task(void *arg)
 {
     TickType_t last_blink = xTaskGetTickCount();
@@ -95,7 +190,6 @@ static void render_task(void *arg)
 
         memset(led_strip_pixels, 0, sizeof(led_strip_pixels));
 
-        // Brake
         if (brake_active) {
             uint8_t r_val = 255;
             if (any_dir) {
@@ -109,7 +203,6 @@ static void render_task(void *arg)
             }
         }
 
-        // Night light
         if (night_active) {
             uint8_t dim = 102;
             for (int r = 0; r < LED_ROWS; r += 4) {
@@ -123,7 +216,6 @@ static void render_task(void *arg)
                     set_pixel(r, c, dim, 0, 0);
                 }
             }
-            // Sinusoidal animation on middle columns
             for (int c = 9; c <= 18; c++) {
                 float phase = (float)(c - 9) / (MID_COLS - 1) * 2.0f * 3.14159f;
                 float wave = (sinf(phase + frame * 0.15f) + 1.0f) / 2.0f;
@@ -133,7 +225,6 @@ static void render_task(void *arg)
             }
         }
 
-        // Directionals
         if (l_on) {
             for (int r = 0; r < LED_ROWS; r++)
                 for (int c = 0; c < LEFT_COLS; c++)
@@ -156,6 +247,10 @@ static void render_task(void *arg)
 
 void app_main(void)
 {
+    ESP_ERROR_CHECK(nvs_flash_init());
+
+    wifi_init();
+
     ESP_LOGI(TAG, "Create RMT TX channel");
     rmt_tx_channel_config_t tx_chan_config = {
         .clk_src = RMT_CLK_SRC_DEFAULT,
@@ -175,12 +270,12 @@ void app_main(void)
     ESP_LOGI(TAG, "Enable RMT TX channel");
     ESP_ERROR_CHECK(rmt_enable(led_chan));
 
-    ESP_LOGI(TAG, "Sistema iniciado. Funciones disponibles:");
-    ESP_LOGI(TAG, "  intermitente_izquierda(bool)");
-    ESP_LOGI(TAG, "  intermitente_derecha(bool)");
-    ESP_LOGI(TAG, "  intermitente_emergencia(bool)");
-    ESP_LOGI(TAG, "  frenado(bool)");
-    ESP_LOGI(TAG, "  luz_nocturna(bool)");
+    esp_mqtt_client_config_t mqtt_cfg = {
+        .broker.address.uri = MQTT_BROKER,
+    };
+    esp_mqtt_client_handle_t mqtt_client = esp_mqtt_client_init(&mqtt_cfg);
+    esp_mqtt_client_register_event(mqtt_client, ESP_EVENT_ANY_ID, mqtt_event_handler, NULL);
+    esp_mqtt_client_start(mqtt_client);
 
     xTaskCreate(render_task, "render", 4096, NULL, 5, NULL);
 }
