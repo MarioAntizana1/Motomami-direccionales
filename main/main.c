@@ -11,40 +11,94 @@
 #include "esp_wifi.h"
 #include "mqtt_client.h"
 
+/* ================================================================
+   PINEO Y MATRIZ
+   ================================================================ */
 #define LED_GPIO_PIN                2
 #define LED_NUM                     140
 #define LED_ROWS                    5
 #define LED_COLS                    28
 #define RMT_LED_STRIP_RESOLUTION_HZ 10000000
 
+/* ================================================================
+   ZONAS DE LA MATRIZ (columnas)
+   ================================================================ */
 #define LEFT_COLS      9
 #define MID_COLS       10
 #define RIGHT_COLS     9
+
+/* ================================================================
+   COLORES PREDETERMINADOS (GRB)
+   ================================================================ */
+#define INTERMITENTE_R   255
+#define INTERMITENTE_G   200
+#define INTERMITENTE_B   0
+
+#define BRAKE_R          255
+#define BRAKE_G          0
+#define BRAKE_B          0
+
+/* ================================================================
+   ANIMACION DE INTERMITENTES
+   ================================================================ */
+#define INTERMITENTE_FRAMES  14
+#define INTERMITENTE_SHRINK  9
+
+/* Crecimiento no lineal: 1 → 2 → 4 → 6 → 9 columnas */
+static const int GROW_COLS[] = {1, 2, 4, 6, 9};
+
+#define INTERMITENTE_ROWS_SHRINK  {1, 2, 3}
+#define INTERMITENTE_ROW_GROW     2
+
+/* ================================================================
+   ANIMACION DE LUZ NOCTURNA
+   ================================================================ */
+#define NIGHT_PULSE_FRAMES    60
+#define NIGHT_SATURATION      200
+#define NIGHT_MIN_BRIGHT      5
+#define NIGHT_MAX_BRIGHT      76
+#define NIGHT_HUE_SPEED       2
+#define NIGHT_HUE_OFFSET_ROW  40
+
+/* ================================================================
+   TIEMPOS
+   ================================================================ */
 #define RENDER_MS      71
 
+/* ================================================================
+   WIFI / MQTT
+   ================================================================ */
 #define WIFI_SSID      "Mario-wifi"
 #define WIFI_PASS      "572Huanuco321"
 #define MQTT_BROKER    "mqtt://192.168.31.173"
 
+/* ================================================================
+   ESTADO GLOBAL
+   ================================================================ */
 static const char *TAG = "neo";
 
 static uint8_t led_strip_pixels[LED_NUM * 3];
 static rmt_channel_handle_t led_chan;
 static rmt_encoder_handle_t led_encoder;
 
-static bool left_active = false;
-static bool right_active = false;
+static bool left_active   = false;
+static bool right_active  = false;
 static bool hazard_active = false;
-static bool brake_active = false;
-static bool night_active = false;
+static bool brake_active  = false;
+static bool night_active  = false;
+
 static uint8_t night_intensity = 100;
-static uint8_t main_intensity = 100;
+static uint8_t main_intensity  = 100;
+
 static uint32_t frame = 0;
 
 static esp_mqtt_client_handle_t mqtt_client;
 static bool wifi_connected = false;
 
-static uint32_t get_led_index(uint32_t row, uint32_t col)
+/* ================================================================
+   PIXELES — funciones de bajo nivel
+   ================================================================ */
+static uint32_t index_of(uint32_t row, uint32_t col)
 {
     if (row % 2 == 0)
         return row * LED_COLS + (LED_COLS - 1 - col);
@@ -54,12 +108,27 @@ static uint32_t get_led_index(uint32_t row, uint32_t col)
 
 static void set_pixel(uint32_t row, uint32_t col, uint8_t r, uint8_t g, uint8_t b)
 {
-    uint32_t idx = get_led_index(row, col);
+    uint32_t idx = index_of(row, col);
     led_strip_pixels[idx * 3 + 0] = g;
     led_strip_pixels[idx * 3 + 1] = r;
     led_strip_pixels[idx * 3 + 2] = b;
 }
 
+static void clear_leds(void)
+{
+    memset(led_strip_pixels, 0, sizeof(led_strip_pixels));
+}
+
+static void send_leds(void)
+{
+    rmt_transmit_config_t tx = { .loop_count = 0 };
+    rmt_transmit(led_chan, led_encoder, led_strip_pixels, sizeof(led_strip_pixels), &tx);
+    rmt_tx_wait_all_done(led_chan, portMAX_DELAY);
+}
+
+/* ================================================================
+   HSV → RGB
+   ================================================================ */
 static void hsv_to_rgb(uint8_t h, uint8_t s, uint8_t v, uint8_t *r, uint8_t *g, uint8_t *b)
 {
     uint8_t region, remainder, p, q, t;
@@ -86,6 +155,9 @@ static void set_pixel_hsv(uint32_t row, uint32_t col, uint8_t h, uint8_t s, uint
     set_pixel(row, col, r, g, b);
 }
 
+/* ================================================================
+   INTERMITENTES — animación de un lado
+   ================================================================ */
 void intermitente_izquierda(bool activar)
 {
     left_active = activar;
@@ -104,18 +176,129 @@ void intermitente_emergencia(bool activar)
     ESP_LOGI(TAG, "intermitente_emergencia: %s", activar ? "ON" : "OFF");
 }
 
+static int intermitente_columnas_encendidas(uint32_t phase)
+{
+    if (phase < INTERMITENTE_SHRINK)
+        return INTERMITENTE_SHRINK - (int)phase;
+    else
+        return GROW_COLS[phase - INTERMITENTE_SHRINK];
+}
+
+static void draw_intermitente_side(bool active, int ncols, int offset, uint32_t f, bool reverse)
+{
+    if (!active) return;
+
+    uint32_t phase = f % INTERMITENTE_FRAMES;
+    int lit = intermitente_columnas_encendidas(phase);
+
+    uint8_t cr = (INTERMITENTE_R * main_intensity) / 100;
+    uint8_t cg = (INTERMITENTE_G * main_intensity) / 100;
+    uint8_t cb = (INTERMITENTE_B * main_intensity) / 100;
+
+    if (phase < INTERMITENTE_SHRINK) {
+        int rows[] = INTERMITENTE_ROWS_SHRINK;
+        for (int i = 0; i < 3; i++)
+            for (int c = 0; c < lit; c++)
+                set_pixel(rows[i], reverse ? (offset + ncols - 1 - c) : (offset + c), cr, cg, cb);
+    } else {
+        for (int c = 0; c < lit; c++)
+            set_pixel(INTERMITENTE_ROW_GROW, reverse ? (offset + ncols - 1 - c) : (offset + c), cr, cg, cb);
+    }
+}
+
+static void draw_intermitentes(void)
+{
+    bool any = left_active || right_active || hazard_active;
+    if (!any) return;
+
+    draw_intermitente_side(left_active || hazard_active, LEFT_COLS, 0, frame, false);
+    draw_intermitente_side(right_active || hazard_active, RIGHT_COLS, LED_COLS - RIGHT_COLS, frame, true);
+}
+
+/* ================================================================
+   FRENADO
+   ================================================================ */
 void frenado(bool activar)
 {
     brake_active = activar;
     ESP_LOGI(TAG, "frenado: %s", activar ? "ON" : "OFF");
 }
 
+static void draw_brake(void)
+{
+    uint8_t r_val = (BRAKE_R * main_intensity) / 100;
+    uint8_t g_val = (BRAKE_G * main_intensity) / 100;
+    uint8_t b_val = (BRAKE_B * main_intensity) / 100;
+
+    bool any_dir = left_active || right_active || hazard_active;
+
+    if (any_dir) {
+        for (int r = 0; r < LED_ROWS; r++)
+            for (int c = 9; c <= 18; c++)
+                set_pixel(r, c, r_val, g_val, b_val);
+    } else {
+        for (int r = 0; r < LED_ROWS; r++)
+            for (int c = 0; c < LED_COLS; c++)
+                set_pixel(r, c, r_val, g_val, b_val);
+    }
+}
+
+/* ================================================================
+   LUZ NOCTURNA
+   ================================================================ */
 void luz_nocturna(bool activar)
 {
     night_active = activar;
     ESP_LOGI(TAG, "luz_nocturna: %s", activar ? "ON" : "OFF");
 }
 
+static void draw_night_light(void)
+{
+    uint32_t bp = frame % NIGHT_PULSE_FRAMES;
+    uint32_t half = NIGHT_PULSE_FRAMES / 2;
+
+    uint8_t v;
+    if (bp < half)
+        v = NIGHT_MIN_BRIGHT + (bp * (NIGHT_MAX_BRIGHT - NIGHT_MIN_BRIGHT)) / half;
+    else
+        v = NIGHT_MIN_BRIGHT + ((NIGHT_PULSE_FRAMES - 1 - bp) * (NIGHT_MAX_BRIGHT - NIGHT_MIN_BRIGHT)) / half;
+
+    v = (v * night_intensity) / 100;
+
+    uint8_t hue = (uint8_t)(frame * NIGHT_HUE_SPEED);
+
+    for (int c = 0; c < LED_COLS; c++) {
+        set_pixel_hsv(0, c, hue, NIGHT_SATURATION, v);
+        set_pixel_hsv(2, c, hue, NIGHT_SATURATION, v);
+        set_pixel_hsv(4, c, (uint8_t)(hue + NIGHT_HUE_OFFSET_ROW), NIGHT_SATURATION, v);
+    }
+}
+
+/* ================================================================
+   RENDER LOOP
+   ================================================================ */
+static void render_task(void *arg)
+{
+    while (1) {
+        clear_leds();
+
+        if (brake_active)
+            draw_brake();
+
+        if (night_active && !brake_active)
+            draw_night_light();
+
+        draw_intermitentes();
+
+        send_leds();
+        frame++;
+        vTaskDelay(pdMS_TO_TICKS(RENDER_MS));
+    }
+}
+
+/* ================================================================
+   MQTT
+   ================================================================ */
 static void mqtt_event_handler(void *args, esp_event_base_t base, int32_t event_id, void *data)
 {
     esp_mqtt_event_t *event = data;
@@ -188,6 +371,9 @@ static void start_mqtt(void)
     esp_mqtt_client_start(mqtt_client);
 }
 
+/* ================================================================
+   WIFI
+   ================================================================ */
 static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
     if (id == WIFI_EVENT_STA_START) {
@@ -230,103 +416,9 @@ static void wifi_init(void)
     ESP_LOGI(TAG, "WiFi connecting to %s...", WIFI_SSID);
 }
 
-static void draw_directional_side(bool active, int ncols, int offset, uint32_t f, bool reverse)
-{
-    if (!active) return;
-
-    uint32_t total_frames = 14;
-    uint32_t phase = f % total_frames;
-
-    uint8_t cr = (255 * main_intensity) / 100;
-    uint8_t cg = (200 * main_intensity) / 100;
-    uint8_t cb = 0;
-    int lit;
-
-    if (phase < 9) {
-        lit = 9 - (int)phase;
-    } else {
-        static const int grow[] = {1, 2, 4, 6, 9};
-        lit = grow[phase - 9];
-    }
-
-    int rows_shrink[3] = {1, 2, 3};
-    int n_shrink = 3;
-
-    if (phase < 9) {
-        for (int i = 0; i < n_shrink; i++) {
-            for (int c = 0; c < lit; c++) {
-                int col = reverse ? (offset + ncols - 1 - c) : (offset + c);
-                set_pixel(rows_shrink[i], col, cr, cg, cb);
-            }
-        }
-    } else {
-        for (int c = 0; c < lit; c++) {
-            int col = reverse ? (offset + ncols - 1 - c) : (offset + c);
-            set_pixel(2, col, cr, cg, cb);
-        }
-    }
-}
-
-static void draw_night_light(uint32_t f)
-{
-    uint32_t period = 60;
-    uint32_t bp = f % period;
-    uint32_t half = period / 2;
-    uint8_t v;
-    if (bp < half)
-        v = 5 + (bp * 71) / half;
-    else
-        v = 5 + ((period - 1 - bp) * 71) / half;
-
-    v = (v * night_intensity) / 100;
-
-    uint8_t h = (uint8_t)(f * 2);
-
-    for (int c = 0; c < LED_COLS; c++) {
-        set_pixel_hsv(0, c, h, 200, v);
-        set_pixel_hsv(2, c, h, 200, v);
-        set_pixel_hsv(4, c, (uint8_t)(h + 40), 200, v);
-    }
-}
-
-static void render_task(void *arg)
-{
-    while (1) {
-        bool any_dir = left_active || right_active || hazard_active;
-
-        memset(led_strip_pixels, 0, sizeof(led_strip_pixels));
-
-        if (brake_active) {
-            uint8_t r_val = (255 * main_intensity) / 100;
-            if (any_dir) {
-                for (int r = 0; r < LED_ROWS; r++)
-                    for (int c = 9; c <= 18; c++)
-                        set_pixel(r, c, r_val, 0, 0);
-            } else {
-                for (int r = 0; r < LED_ROWS; r++)
-                    for (int c = 0; c < LED_COLS; c++)
-                        set_pixel(r, c, r_val, 0, 0);
-            }
-        }
-
-        if (night_active && !brake_active) {
-            draw_night_light(frame);
-        }
-
-        if (any_dir) {
-            draw_directional_side(left_active || hazard_active, LEFT_COLS, 0, frame, false);
-            draw_directional_side(right_active || hazard_active, RIGHT_COLS, LED_COLS - RIGHT_COLS, frame, true);
-        }
-
-        rmt_transmit_config_t tx = { .loop_count = 0 };
-        rmt_transmit(led_chan, led_encoder, led_strip_pixels, sizeof(led_strip_pixels), &tx);
-        rmt_tx_wait_all_done(led_chan, portMAX_DELAY);
-
-        frame++;
-        vTaskDelay(pdMS_TO_TICKS(RENDER_MS));
-    }
-}
-
+/* ================================================================
+   MAIN
+   ================================================================ */
 void app_main(void)
 {
     ESP_ERROR_CHECK(nvs_flash_init());
