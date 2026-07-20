@@ -33,6 +33,19 @@ AGENTS.md                 # Memoria del proyecto (este archivo)
 - `get_led_index(row, col)`: mapeo zig-zag (filas pares ← derecha a izquierda, impares → izquierda a derecha)
 - Formato de color: GRB (Green, Blue, Red)
 
+## Reglas de workflow automático
+
+Cada vez que se modifique código en `main/` (main.c, led_strip_encoder.c/h, CMakeLists.txt)
+o la configuración del proyecto (sdkconfig, CMakeLists.txt), debes ejecutar estos pasos
+en orden:
+
+1. **Compilar** → `idf.py build`
+2. **Grabar al ESP32-C6** → `idf.py -p COM3 flash`
+3. **Commit a Git** → `git add -A && git commit -m "mensaje descriptivo"`
+4. **Actualizar graphify** → `graphify.exe <proyecto> --code-only --cluster-only`
+
+Si algún paso falla, detente, informa el error y no continúes con los siguientes.
+
 ## Workarounds
 - `riscv32-esp-elf-readelf.exe` bloqueado por AppLocker → reemplazar con copia de `objdump.exe`
   ```powershell
