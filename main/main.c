@@ -69,9 +69,9 @@ static const int GROW_COLS[] = {1, 2, 4, 6, 9};
 /* ================================================================
    WIFI / MQTT
    ================================================================ */
-#define WIFI_SSID      "Mario-wifi"
-#define WIFI_PASS      "572Huanuco321"
-#define MQTT_BROKER    "mqtt://192.168.31.173"
+#define WIFI_SSID      "Motomami-net"
+#define WIFI_PASS      "ktiarts123+++++/"
+#define MQTT_BROKER    "mqtt://192.168.42.1"
 
 /* ================================================================
    ESTADO GLOBAL
