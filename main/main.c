@@ -1,4 +1,5 @@
 #include <string.h>
+#include <stdio.h>
 #include <math.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -94,6 +95,7 @@ static uint8_t main_intensity  = 100;
 static uint32_t frame = 0;
 
 static esp_mqtt_client_handle_t mqtt_client;
+static esp_netif_t *netif = NULL;
 static bool wifi_connected = false;
 
 /* ================================================================
@@ -287,6 +289,15 @@ static void draw_night_light(void)
 static void render_task(void *arg)
 {
     while (1) {
+        if (frame % 300 == 0 && mqtt_client) {
+            wifi_ap_record_t ap_info;
+            if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK) {
+                char rssi_str[8];
+                sprintf(rssi_str, "%d", ap_info.rssi);
+                esp_mqtt_client_publish(mqtt_client, "motomami/status/rssi", rssi_str, 0, 1, true);
+            }
+        }
+
         clear_leds();
 
         if (brake_active)
@@ -321,6 +332,28 @@ static void mqtt_event_handler(void *args, esp_event_base_t base, int32_t event_
         esp_mqtt_client_subscribe(client, "motomami/luz_nocturna", 1);
         esp_mqtt_client_subscribe(client, "motomami/luz_nocturna/intensidad", 1);
         esp_mqtt_client_subscribe(client, "motomami/intensidad", 1);
+
+        esp_mqtt_client_publish(client, "motomami/status", "online", 6, 1, true);
+
+        {
+            esp_netif_ip_info_t ip_info;
+            if (netif && esp_netif_get_ip_info(netif, &ip_info) == ESP_OK) {
+                char ip_str[16];
+                sprintf(ip_str, IPSTR, IP2STR(&ip_info.ip));
+                esp_mqtt_client_publish(client, "motomami/status/ip", ip_str, 0, 1, true);
+                ESP_LOGI(TAG, "IP: %s", ip_str);
+            }
+        }
+
+        {
+            wifi_ap_record_t ap_info;
+            if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK) {
+                char rssi_str[8];
+                sprintf(rssi_str, "%d", ap_info.rssi);
+                esp_mqtt_client_publish(client, "motomami/status/rssi", rssi_str, 0, 1, true);
+                ESP_LOGI(TAG, "RSSI: %d", ap_info.rssi);
+            }
+        }
         break;
 
     case MQTT_EVENT_DATA: {
@@ -372,6 +405,11 @@ static void start_mqtt(void)
 {
     esp_mqtt_client_config_t mqtt_cfg = {
         .broker.address.uri = MQTT_BROKER,
+        .session.last_will.topic = "motomami/status",
+        .session.last_will.msg = "offline",
+        .session.last_will.msg_len = 7,
+        .session.last_will.qos = 1,
+        .session.last_will.retain = true,
     };
     mqtt_client = esp_mqtt_client_init(&mqtt_cfg);
     esp_mqtt_client_register_event(mqtt_client, ESP_EVENT_ANY_ID, mqtt_event_handler, NULL);
@@ -400,7 +438,7 @@ static void wifi_init(void)
 {
     esp_netif_init();
     esp_event_loop_create_default();
-    esp_netif_create_default_wifi_sta();
+    netif = esp_netif_create_default_wifi_sta();
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     esp_wifi_init(&cfg);
