@@ -53,12 +53,13 @@ static const int GROW_COLS[] = {1, 2, 4, 6, 9};
 /* ================================================================
    ANIMACION DE LUZ NOCTURNA
    ================================================================ */
-#define NIGHT_PULSE_FRAMES    60
+#define NIGHT_PULSE_FRAMES    30
 #define NIGHT_SATURATION      200
 #define NIGHT_MIN_BRIGHT      5
 #define NIGHT_MAX_BRIGHT      76
-#define NIGHT_HUE_SPEED       2
-#define NIGHT_HUE_OFFSET_ROW  40
+#define NIGHT_HUE_MIN         140
+#define NIGHT_HUE_MAX         210
+#define NIGHT_HUE_OFFSET_ROW  20
 
 /* ================================================================
    TIEMPOS
@@ -265,7 +266,13 @@ static void draw_night_light(void)
 
     v = (v * night_intensity) / 100;
 
-    uint8_t hue = (uint8_t)(frame * NIGHT_HUE_SPEED);
+    uint32_t hrange = NIGHT_HUE_MAX - NIGHT_HUE_MIN;
+    uint32_t hp = frame % (hrange * 2);
+    uint8_t hue;
+    if (hp < hrange)
+        hue = NIGHT_HUE_MIN + hp;
+    else
+        hue = NIGHT_HUE_MIN + (hrange * 2 - hp);
 
     for (int c = 0; c < LED_COLS; c++) {
         set_pixel_hsv(0, c, hue, NIGHT_SATURATION, v);
