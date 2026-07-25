@@ -10,7 +10,9 @@
 #include "esp_netif.h"
 #include "esp_event.h"
 #include "esp_wifi.h"
+#include "esp_timer.h"
 #include "mqtt_client.h"
+#include "ota_server.h"
 
 /* ================================================================
    PINEO Y MATRIZ
@@ -74,6 +76,9 @@ static const int GROW_COLS[] = {1, 2, 4, 6, 9};
 #define WIFI_PASS      "ktiarts123+++++/"
 #define MQTT_BROKER    "mqtt://192.168.42.1"
 
+#define WIFI_RETRY_US      (1000 * 1000)   /* backoff 1 s al reconectar WiFi */
+#define MQTT_RECONNECT_MS  1000            /* reconexion MQTT rapida */
+
 /* ================================================================
    ESTADO GLOBAL
    ================================================================ */
@@ -96,7 +101,10 @@ static uint32_t frame = 0;
 
 static esp_mqtt_client_handle_t mqtt_client;
 static esp_netif_t *netif = NULL;
-static bool wifi_connected = false;
+static esp_timer_handle_t wifi_retry_timer = NULL;
+
+/* Contador de mensajes publicados (parametro de control "ID") */
+static uint32_t msg_id = 0;
 
 /* ================================================================
    PIXELES — funciones de bajo nivel
@@ -295,6 +303,9 @@ static void render_task(void *arg)
                 char rssi_str[8];
                 sprintf(rssi_str, "%d", ap_info.rssi);
                 esp_mqtt_client_publish(mqtt_client, "motomami/status/rssi", rssi_str, 0, 1, true);
+                char id_str[12];
+                sprintf(id_str, "%lu", ++msg_id);
+                esp_mqtt_client_publish(mqtt_client, "motomami/status/id", id_str, 0, 1, true);
             }
         }
 
@@ -354,11 +365,17 @@ static void mqtt_event_handler(void *args, esp_event_base_t base, int32_t event_
                 ESP_LOGI(TAG, "RSSI: %d", ap_info.rssi);
             }
         }
+
+        {
+            char id_str[12];
+            sprintf(id_str, "%lu", msg_id);
+            esp_mqtt_client_publish(client, "motomami/status/id", id_str, 0, 1, true);
+        }
         break;
 
     case MQTT_EVENT_DATA: {
         char topic[64];
-        char payload[16];
+        char payload[32];
         int tlen = event->topic_len;
         int plen = event->data_len;
         if (tlen >= sizeof(topic)) tlen = sizeof(topic) - 1;
@@ -368,7 +385,10 @@ static void mqtt_event_handler(void *args, esp_event_base_t base, int32_t event_
         memcpy(payload, event->data, plen);
         payload[plen] = 0;
 
-        bool on = (strcasecmp(payload, "ON") == 0);
+        /* Acepta "ON"/"OFF" plano y "<id>:ON"/"<id>:OFF" (input publica con id) */
+        const char *state_str = strrchr(payload, ':');
+        state_str = state_str ? state_str + 1 : payload;
+        bool on = (strcasecmp(state_str, "ON") == 0);
 
         if (strcmp(topic, "motomami/intermitente_izquierda") == 0)
             intermitente_izquierda(on);
@@ -403,8 +423,14 @@ static void mqtt_event_handler(void *args, esp_event_base_t base, int32_t event_
 
 static void start_mqtt(void)
 {
+    /* GOT_IP se dispara en cada reconexion WiFi: crear el cliente una sola vez.
+     * esp_mqtt ya auto-reconecta por si solo. */
+    if (mqtt_client != NULL) {
+        return;
+    }
     esp_mqtt_client_config_t mqtt_cfg = {
         .broker.address.uri = MQTT_BROKER,
+        .network.reconnect_timeout_ms = MQTT_RECONNECT_MS,
         .session.last_will.topic = "motomami/status",
         .session.last_will.msg = "offline",
         .session.last_will.msg_len = 7,
@@ -419,18 +445,28 @@ static void start_mqtt(void)
 /* ================================================================
    WIFI
    ================================================================ */
+static void wifi_retry_cb(void *arg)
+{
+    esp_wifi_connect();
+}
+
 static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
     if (id == WIFI_EVENT_STA_START) {
         esp_wifi_connect();
     } else if (id == WIFI_EVENT_STA_DISCONNECTED) {
-        wifi_connected = false;
-        esp_wifi_connect();
-        ESP_LOGI(TAG, "WiFi reconnect...");
+        /* backoff corto para no reconectar en rafaga si el AP esta caido */
+        ESP_LOGI(TAG, "WiFi caido, reintento en 1 s...");
+        if (wifi_retry_timer) {
+            esp_timer_start_once(wifi_retry_timer, WIFI_RETRY_US);
+        }
     } else if (id == IP_EVENT_STA_GOT_IP) {
-        wifi_connected = true;
-        ESP_LOGI(TAG, "WiFi connected, starting MQTT...");
+        if (wifi_retry_timer) {
+            esp_timer_stop(wifi_retry_timer);
+        }
+        ESP_LOGI(TAG, "WiFi connected, starting MQTT + OTA...");
         start_mqtt();
+        ota_server_start();
     }
 }
 
@@ -443,10 +479,21 @@ static void wifi_init(void)
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     esp_wifi_init(&cfg);
 
+    /* El AP (RPi) esta en la propia moto a <2 m: 10 dBm sobra.
+     * Reduce el pico de corriente (tambien en la calibracion RF),
+     * el consumo y el calor. */
+    esp_wifi_set_max_tx_power(40);
+
     esp_event_handler_instance_t instance_any;
     esp_event_handler_instance_t instance_got_ip;
     esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL, &instance_any);
     esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL, &instance_got_ip);
+
+    const esp_timer_create_args_t retry_args = {
+        .callback = wifi_retry_cb,
+        .name = "wifi_retry",
+    };
+    esp_timer_create(&retry_args, &wifi_retry_timer);
 
     wifi_config_t wifi_config = {
         .sta = {
@@ -467,6 +514,8 @@ static void wifi_init(void)
 void app_main(void)
 {
     ESP_ERROR_CHECK(nvs_flash_init());
+
+    ota_boot_init();   // auto-validacion anti-rollback (30 s)
 
     wifi_init();
 
