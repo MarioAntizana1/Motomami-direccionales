@@ -5,6 +5,7 @@
 #include "freertos/task.h"
 #include "esp_log.h"
 #include "driver/rmt_tx.h"
+#include "driver/gpio.h"
 #include "led_strip_encoder.h"
 #include "nvs_flash.h"
 #include "esp_netif.h"
@@ -12,6 +13,7 @@
 #include "esp_wifi.h"
 #include "esp_timer.h"
 #include "mqtt_client.h"
+#include "esp_now.h"
 #include "ota_server.h"
 
 /* ================================================================
@@ -79,6 +81,8 @@ static const int GROW_COLS[] = {1, 2, 4, 6, 9};
 #define WIFI_RETRY_US      (1000 * 1000)   /* backoff 1 s al reconectar WiFi */
 #define MQTT_RECONNECT_MS  1000            /* reconexion MQTT rapida */
 
+#define ESPNOW_CHANNEL 6
+
 /* ================================================================
    ESTADO GLOBAL
    ================================================================ */
@@ -98,6 +102,12 @@ static uint8_t night_intensity = 100;
 static uint8_t main_intensity  = 100;
 
 static uint32_t frame = 0;
+
+static volatile uint32_t espnow_last_id = 0;
+
+#define RMT_TX_TIMEOUT_MS 500
+#define WDT_TIMEOUT_US    (5 * 1000 * 1000)
+static volatile int64_t wdt_last_kick_us = 0;
 
 static esp_mqtt_client_handle_t mqtt_client;
 static esp_netif_t *netif = NULL;
@@ -134,7 +144,10 @@ static void send_leds(void)
 {
     rmt_transmit_config_t tx = { .loop_count = 0 };
     rmt_transmit(led_chan, led_encoder, led_strip_pixels, sizeof(led_strip_pixels), &tx);
-    rmt_tx_wait_all_done(led_chan, portMAX_DELAY);
+    if (rmt_tx_wait_all_done(led_chan, pdMS_TO_TICKS(RMT_TX_TIMEOUT_MS)) != ESP_OK) {
+        ESP_LOGE(TAG, "RMT sin respuesta, reiniciando");
+        esp_restart();
+    }
 }
 
 /* ================================================================
@@ -263,6 +276,42 @@ void luz_nocturna(bool activar)
     ESP_LOGI(TAG, "luz_nocturna: %s", activar ? "ON" : "OFF");
 }
 
+static void espnow_recv_cb(const esp_now_recv_info_t *info, const uint8_t *data, int len)
+{
+    (void)info;
+    if (len < 7 || len >= 24) return;              /* "id:LLLLL" */
+    char buf[24];
+    memcpy(buf, data, len);
+    buf[len] = 0;
+
+    char *colon = strchr(buf, ':');
+    if (!colon) return;
+    *colon = 0;
+    uint32_t id = strtoul(buf, NULL, 10);
+    int32_t diff = (int32_t)(id - espnow_last_id);
+    if (diff <= 0 && diff > -10000) return;        /* duplicado/atrasado; -10000 tolera reboot del emisor */
+
+    const char *s = colon + 1;
+    if (strlen(s) < 5) return;
+
+    espnow_last_id = id;
+    left_active   = (s[0] == '0');
+    right_active  = (s[1] == '0');
+    hazard_active = (s[2] == '0');
+    brake_active  = (s[3] == '0');
+    night_active  = (s[4] == '0');
+    ESP_LOGI(TAG, "ESP-NOW %lu:%c%c%c%c%c", id, s[0], s[1], s[2], s[3], s[4]);
+}
+
+static void wdt_timer_cb(void *arg)
+{
+    (void)arg;
+    if ((esp_timer_get_time() - wdt_last_kick_us) > WDT_TIMEOUT_US) {
+        ESP_LOGE(TAG, "WDT: render loop colgado, reiniciando");
+        esp_restart();
+    }
+}
+
 static void draw_night_light(void)
 {
     uint32_t bp = frame % NIGHT_PULSE_FRAMES;
@@ -297,6 +346,8 @@ static void draw_night_light(void)
 static void render_task(void *arg)
 {
     while (1) {
+        wdt_last_kick_us = esp_timer_get_time();
+
         if (frame % 300 == 0 && mqtt_client) {
             wifi_ap_record_t ap_info;
             if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK) {
@@ -336,11 +387,6 @@ static void mqtt_event_handler(void *args, esp_event_base_t base, int32_t event_
     switch ((esp_mqtt_event_id_t)event_id) {
     case MQTT_EVENT_CONNECTED:
         ESP_LOGI(TAG, "MQTT connected");
-        esp_mqtt_client_subscribe(client, "motomami/intermitente_izquierda", 1);
-        esp_mqtt_client_subscribe(client, "motomami/intermitente_derecha", 1);
-        esp_mqtt_client_subscribe(client, "motomami/intermitente_emergencia", 1);
-        esp_mqtt_client_subscribe(client, "motomami/frenado", 1);
-        esp_mqtt_client_subscribe(client, "motomami/luz_nocturna", 1);
         esp_mqtt_client_subscribe(client, "motomami/luz_nocturna/intensidad", 1);
         esp_mqtt_client_subscribe(client, "motomami/intensidad", 1);
 
@@ -385,22 +431,7 @@ static void mqtt_event_handler(void *args, esp_event_base_t base, int32_t event_
         memcpy(payload, event->data, plen);
         payload[plen] = 0;
 
-        /* Acepta "ON"/"OFF" plano y "<id>:ON"/"<id>:OFF" (input publica con id) */
-        const char *state_str = strrchr(payload, ':');
-        state_str = state_str ? state_str + 1 : payload;
-        bool on = (strcasecmp(state_str, "ON") == 0);
-
-        if (strcmp(topic, "motomami/intermitente_izquierda") == 0)
-            intermitente_izquierda(on);
-        else if (strcmp(topic, "motomami/intermitente_derecha") == 0)
-            intermitente_derecha(on);
-        else if (strcmp(topic, "motomami/intermitente_emergencia") == 0)
-            intermitente_emergencia(on);
-        else if (strcmp(topic, "motomami/frenado") == 0)
-            frenado(on);
-        else if (strcmp(topic, "motomami/luz_nocturna") == 0)
-            luz_nocturna(on);
-        else if (strcmp(topic, "motomami/luz_nocturna/intensidad") == 0) {
+        if (strcmp(topic, "motomami/luz_nocturna/intensidad") == 0) {
             int val = atoi(payload);
             if (val >= 0 && val <= 100) night_intensity = (uint8_t)val;
             ESP_LOGI(TAG, "night_intensity: %d%%", night_intensity);
@@ -450,9 +481,25 @@ static void wifi_retry_cb(void *arg)
     esp_wifi_connect();
 }
 
+static void espnow_init(void)
+{
+    esp_err_t err = esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "set_channel %d: %s", ESPNOW_CHANNEL, esp_err_to_name(err));
+    }
+    err = esp_now_init();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_now_init: %s (ESP-NOW desactivado)", esp_err_to_name(err));
+        return;
+    }
+    esp_now_register_recv_cb(espnow_recv_cb);
+    ESP_LOGI(TAG, "ESP-NOW receptor listo (canal %d)", ESPNOW_CHANNEL);
+}
+
 static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
     if (id == WIFI_EVENT_STA_START) {
+        espnow_init();
         esp_wifi_connect();
     } else if (id == WIFI_EVENT_STA_DISCONNECTED) {
         /* backoff corto para no reconectar en rafaga si el AP esta caido */
@@ -478,6 +525,10 @@ static void wifi_init(void)
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     esp_wifi_init(&cfg);
+
+    /* Antena externa u.FL: GPIO14=HIGH activa el RF switch del XIAO C6 */
+    gpio_set_direction(GPIO_NUM_14, GPIO_MODE_OUTPUT);
+    gpio_set_level(GPIO_NUM_14, 1);
 
     /* El AP (RPi) esta en la propia moto a <2 m: 10 dBm sobra.
      * Reduce el pico de corriente (tambien en la calibracion RF),
@@ -539,4 +590,9 @@ void app_main(void)
     ESP_ERROR_CHECK(rmt_enable(led_chan));
 
     xTaskCreate(render_task, "render", 4096, NULL, 5, NULL);
+
+    esp_timer_create_args_t wdt_args = { .callback = wdt_timer_cb, .name = "sw_wdt" };
+    esp_timer_handle_t wdt_timer;
+    ESP_ERROR_CHECK(esp_timer_create(&wdt_args, &wdt_timer));
+    ESP_ERROR_CHECK(esp_timer_start_periodic(wdt_timer, 1000 * 1000));
 }
